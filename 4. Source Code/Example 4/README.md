@@ -29,9 +29,293 @@ This project benchmark and evaluates two discrete solution sets (**Approximation
 
 ---
 
-## 🚀 Getting Started
+## Code
 
-### Prerequisites
+```python
+"""
+Performance Metrics for Multi-Objective Evolutionary Algorithms (MOEAs)
+=======================================================================
+Based on Chapter 8 of Deb (2001/2021): "Salient Issues of MOEAs"
+
+Two DISCRETE approximations A and B of a NON-CONVEX, CONTINUOUS
+Pareto front (quarter circle, r = 1):
+    - Different numbers of non-dominated solutions (A: 8, B: 12)
+    - A is better on the left part, B is better on the right part
+    - Both cover the ENTIRE front (no gap in the central region)
+    - NO solution of A or B dominates the true Pareto front (validated)
+
+Metrics implemented:
+    1. Error Ratio (ER)              -> convergence
+    2. Generational Distance (GD)    -> convergence
+    3. Spacing (S)                   -> diversity
+    4. Spread (Delta)                -> diversity
+    5. Hypervolume (HV)              -> combined
+    6. Attainment Surface Comparison -> statistical
+    7. Number of Non-Dominated Solutions (NNDS)
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import mannwhitneyu
+
+
+# =============================================================
+# 1. TRUE PARETO FRONT (non-convex, continuous)
+# =============================================================
+# Quarter circle f1^2 + f2^2 = 1, f1, f2 >= 0 (concave => non-convex
+# front for minimization).
+def true_pareto_front(n_points=800):
+    t = np.linspace(0.0, np.pi / 2, n_points)
+    return np.column_stack((np.cos(t), np.sin(t)))
+
+
+def distance_to_front(approx):
+    """
+    EXACT Euclidean distance from each point to the true front.
+    For the unit quarter circle, and points in the first quadrant,
+    the closest front point is the radial projection, so
+        d = | ||p|| - 1 |.
+    (No discretization error.)
+    """
+    approx = np.atleast_2d(approx)
+    return np.abs(np.linalg.norm(approx, axis=1) - 1.0)
+
+
+# =============================================================
+# 2. TWO DISCRETE APPROXIMATIONS (cover the whole front)
+# =============================================================
+def polar(angles_deg, radii):
+    a = np.radians(np.asarray(angles_deg, dtype=float))
+    r = np.asarray(radii, dtype=float)
+    return np.column_stack((r * np.cos(a), r * np.sin(a)))
+
+
+# --- Approximation A: 8 solutions, better on the LEFT ---------------
+ang_A = [88, 77, 66, 55, 44, 33, 20, 6]
+rad_A = [1.005, 1.008, 1.012, 1.030, 1.060, 1.090, 1.120, 1.150]
+A = polar(ang_A, rad_A)
+
+# --- Approximation B: 12 solutions, better on the RIGHT -------------
+ang_B = [86, 79, 72, 65, 58, 51, 44, 37, 30, 23, 15, 6]
+rad_B = [1.150, 1.130, 1.110, 1.090, 1.070, 1.050,
+         1.035, 1.020, 1.010, 1.006, 1.004, 1.003]
+B = polar(ang_B, rad_B)
+
+REFERENCE = np.array([1.4, 1.4])
+
+# Tolerance for "belongs to the true Pareto front" (Error Ratio)
+ER_TOL = 0.05
+_EPS = 1e-9          # guards against floating-point ties on the boundary
+
+
+# =============================================================
+# 2b. VALIDATION: approximations can never beat the true front
+# =============================================================
+def dominates(p, q):
+    """True if p dominates q (minimization)."""
+    return np.all(p <= q) and np.any(p < q)
+
+
+def assert_valid_approximation(approx, true_front, name):
+    for i, sol in enumerate(approx):
+        dominated = np.any(np.all(true_front <= sol, axis=1) &
+                           np.any(true_front < sol, axis=1))
+        if not dominated:
+            raise ValueError(
+                f"Approximation {name}: solution {i} {sol} is NOT dominated "
+                f"by the true Pareto front (impossible)."
+            )
+    for i in range(len(approx)):
+        for j in range(len(approx)):
+            if i != j and dominates(approx[j], approx[i]):
+                raise ValueError(
+                    f"Approximation {name}: solution {j} dominates {i}."
+                )
+
+
+_dense_front = true_pareto_front(4000)
+assert_valid_approximation(A, _dense_front, "A")
+assert_valid_approximation(B, _dense_front, "B")
+
+
+# =============================================================
+# 3. METRIC IMPLEMENTATIONS
+# =============================================================
+def error_ratio(approx, tol=ER_TOL):
+    """
+    Error Ratio (Van Veldhuizen):  ER = (number of solutions that are
+    NOT members of the true Pareto front) / |approx|.
+
+    Because a continuous front is never hit exactly, a solution is
+    regarded as a member when its exact distance to the front is
+    <= tol. Boundary cases (d == tol) count as members.
+    """
+    d = distance_to_front(approx)
+    n_errors = int(np.sum(d > tol + _EPS))
+    return n_errors / len(approx)
+
+
+def error_ratio_curve(approx, tols):
+    return np.array([error_ratio(approx, t) for t in tols])
+
+
+def generational_distance(approx, p=2):
+    d = distance_to_front(approx)
+    return (np.sum(d ** p) / len(approx)) ** (1.0 / p)
+
+
+def spacing(approx):
+    n = len(approx)
+    d = np.zeros(n)
+    for i in range(n):
+        dists = np.linalg.norm(approx - approx[i], axis=1)
+        dists[i] = np.inf
+        d[i] = np.min(dists)
+    d_bar = np.mean(d)
+    return np.sqrt(np.sum((d - d_bar) ** 2) / (n - 1))
+
+
+def spread(approx, true_front):
+    n = len(approx)
+    idx = np.argsort(approx[:, 0])
+    sorted_approx = approx[idx]
+    d = np.linalg.norm(np.diff(sorted_approx, axis=0), axis=1)
+    d_bar = np.mean(d)
+    extremes_true = np.array([
+        true_front[np.argmin(true_front[:, 0])],
+        true_front[np.argmin(true_front[:, 1])],
+    ])
+    extremes_approx = np.array([sorted_approx[0], sorted_approx[-1]])
+    d_e = np.linalg.norm(extremes_approx - extremes_true, axis=1)
+    numerator = np.sum(d_e) + np.sum(np.abs(d - d_bar))
+    denominator = np.sum(d_e) + (n - 1) * d_bar
+    return numerator / denominator
+
+
+def hypervolume(approx, reference):
+    """2-D hypervolume (minimization), sweep along f1."""
+    idx = np.argsort(approx[:, 0])
+    pts = approx[idx]
+    hv = 0.0
+    prev_f2 = reference[1]
+    for f1, f2 in pts:
+        if f1 >= reference[0] or f2 >= reference[1]:
+            continue
+        if f2 < prev_f2:
+            hv += (reference[0] - f1) * (prev_f2 - f2)
+            prev_f2 = f2
+    return hv
+
+
+def count_non_dominated(approx):
+    n = len(approx)
+    is_nd = np.ones(n, dtype=bool)
+    for i in range(n):
+        for j in range(n):
+            if i != j and dominates(approx[j], approx[i]):
+                is_nd[i] = False
+                break
+    return int(np.sum(is_nd))
+
+
+# =============================================================
+# 4. COMPUTE ALL METRICS
+# =============================================================
+true_front = true_pareto_front(800)
+
+metrics = {}
+for name, approx in [("A", A), ("B", B)]:
+    metrics[name] = {
+        f"Error Ratio (ER, tol={ER_TOL})": error_ratio(approx, ER_TOL),
+        "Generational Distance (GD)":      generational_distance(approx),
+        "Spacing (S)":                     spacing(approx),
+        "Spread (Delta)":                  spread(approx, true_front),
+        "Hypervolume (HV)":                hypervolume(approx, REFERENCE),
+        "NNDS (count)":                    count_non_dominated(approx),
+    }
+
+# --- Sanity check of ER: independent recount, printed explicitly ---
+for name, approx in [("A", A), ("B", B)]:
+    d = distance_to_front(approx)
+    n_err = int(np.sum(d > ER_TOL + _EPS))
+    assert abs(n_err / len(approx) - metrics[name][f"Error Ratio (ER, tol={ER_TOL})"]) < 1e-12
+
+
+# =============================================================
+# 5. PRINT RESULTS
+# =============================================================
+print("=" * 66)
+print("PERFORMANCE METRICS - Two Discrete Non-Convex Approximations")
+print("=" * 66)
+header = f"{'Metric':<32}{'Approx A':>14}{'Approx B':>14}"
+print(header)
+print("-" * len(header))
+for m in metrics["A"]:
+    print(f"{m:<32}{metrics['A'][m]:>14.6f}{metrics['B'][m]:>14.6f}")
+
+print("\nDistance of each solution to the true front (exact):")
+print("  A:", np.round(distance_to_front(A), 4))
+print("  B:", np.round(distance_to_front(B), 4))
+for name, approx in [("A", A), ("B", B)]:
+    n_err = int(np.sum(distance_to_front(approx) > ER_TOL + _EPS))
+    print(f"  ER({name}) = {n_err}/{len(approx)} = {n_err/len(approx):.4f}")
+
+# --- ER as a function of the tolerance (shows sensitivity) ---
+print("\nError Ratio vs. tolerance:")
+print(f"  {'tol':>6}{'ER(A)':>10}{'ER(B)':>10}")
+for t in [0.01, 0.02, 0.03, 0.05, 0.07, 0.10, 0.12, 0.15]:
+    print(f"  {t:>6.2f}{error_ratio(A, t):>10.4f}{error_ratio(B, t):>10.4f}")
+
+print("\nInterpretation:")
+print("  * ER    - lower is better (0 = all solutions on the true front)")
+print("  * GD    - lower is better (closer to the true front)")
+print("  * S     - lower is better (more uniform spacing)")
+print("  * Delta - lower is better (0 = ideal spread)")
+print("  * HV    - higher is better (more dominated volume)")
+print("  * NNDS  - higher means more non-dominated solutions retained")
+
+
+# =============================================================
+# 6. VISUALIZATION
+# =============================================================
+fig, ax = plt.subplots(figsize=(8.5, 7.5))
+
+ax.plot(true_front[:, 0], true_front[:, 1], color="black",
+        linestyle="--", linewidth=2.0,
+        label="True Pareto front (non-convex, continuous)")
+
+ax.plot(A[:, 0], A[:, 1], color="tab:blue", ls="--", lw=1.2, alpha=0.7)
+ax.scatter(A[:, 0], A[:, 1], s=130, c="tab:blue", marker="o",
+           edgecolor="black", linewidth=1.0, zorder=5,
+           label=r"Approximation A — $|A|=8$ (better on the left)")
+
+ax.plot(B[:, 0], B[:, 1], color="tab:red", ls="--", lw=1.2, alpha=0.7)
+ax.scatter(B[:, 0], B[:, 1], s=130, c="tab:red", marker="s",
+           edgecolor="black", linewidth=1.0, zorder=5,
+           label=r"Approximation B — $|B|=12$ (better on the right)")
+
+ax.axvspan(0.00, 0.64, color="tab:blue", alpha=0.06, zorder=0)
+ax.axvspan(0.64, 1.25, color="tab:red",  alpha=0.06, zorder=0)
+ax.axvline(0.64, color="gray", linestyle=":", linewidth=1.0, alpha=0.7)
+
+ax.set_xlabel(r"Objective $f_1$ (to be minimized)", fontsize=12)
+ax.set_ylabel(r"Objective $f_2$ (to be minimized)", fontsize=12)
+ax.set_title("Two Discrete Approximations of a Non-Convex Pareto Front",
+             fontsize=13)
+ax.set_xlim(0.0, 1.25)
+ax.set_ylim(0.0, 1.25)
+ax.grid(alpha=0.3)
+ax.set_aspect("equal", adjustable="box")
+ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.10),
+          ncol=1, fontsize=10, frameon=True)
+
+plt.tight_layout()
+plt.savefig("moea_metrics.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print("\nFigure saved as 'moea_metrics.png'.")
+
+
 
 Make sure you have Python 3.8+ installed along with the required numerical and plotting libraries:
 
